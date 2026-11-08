@@ -1,0 +1,1435 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>假装很忙 · Pretend To Be Busy</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b1016;overflow:hidden;
+    font-family:"Microsoft YaHei","PingFang SC","Hiragino Sans GB",system-ui,sans-serif;}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;}
+  canvas{background:#0b1016;box-shadow:0 0 80px rgba(0,0,0,.85);border-radius:8px;
+    touch-action:none;cursor:pointer;}
+  #selftest-result{position:fixed;left:0;top:0;margin:0;padding:10px;max-height:100vh;
+    overflow:auto;background:#04070b;color:#7dff9b;font:12px/1.6 Consolas,monospace;
+    white-space:pre;z-index:9;}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="1280" height="720"></canvas></div>
+<pre id="selftest-result" hidden></pre>
+<script>
+'use strict';
+/* =====================================================================
+   假装很忙 —— 2D 办公室摸鱼反应小游戏（单文件 HTML5，离线可运行）
+   玩法：老板靠近前把屏幕从「摸鱼」切到「工作」，并收好泡面 / 手机。
+   需求对照见同目录 README.md
+   ===================================================================== */
+
+/* ---------------------------- 基础工具 ---------------------------- */
+const W = 1280, H = 720;
+const cv = document.getElementById('game');
+const ctx = cv.getContext('2d');
+const Q = new URLSearchParams(location.search);
+
+const rnd   = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => (v < a ? a : (v > b ? b : v));
+const lerp  = (a, b, t) => a + (b - a) * t;
+const sign  = v => (v < 0 ? -1 : 1);
+
+function fitCanvas() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  cv.width = W * dpr;
+  cv.height = H * dpr;
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H);
+  cv.style.width = (W * s) + 'px';
+  cv.style.height = (H * s) + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', fitCanvas);
+fitCanvas();
+
+function rr(x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function rect(x, y, w, h, c) { ctx.fillStyle = c; ctx.fillRect(x, y, w, h); }
+function circle(x, y, r, c) { ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fillStyle = c; ctx.fill(); }
+function txt(s, x, y, size, color, align, weight) {
+  ctx.fillStyle = color || '#22303c';
+  ctx.textAlign = align || 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.font = (weight ? weight + ' ' : '') + size + 'px "Microsoft YaHei","PingFang SC",sans-serif';
+  ctx.fillText(s, x, y);
+}
+
+/* ---------------------------- 数值配置 ----------------------------
+   难度递增：移动速度 / 出场间隔 / 检查停留时长 / 双老板概率 随时间变化
+   ------------------------------------------------------------------ */
+const CFG = {
+  easy: {
+    key: 'easy', name: '摸鱼实习生', tag: '3 分钟 · 老板比较温柔', stars: 1,
+    shift: 180, quota: 150,
+    speed: [70, 150], spawn: [10.0, 14.0], check: [1.00, 1.50],
+    speedRamp: 14, spawnRamp: 0.55, checkRamp: 0.10,
+    doubleFrom: 2.5, doubleChance: 0.10,
+    events: { turnBack: 0.10, ring: 0.16, blackout: 0.10, wave: 0.30 }
+  },
+  normal: {
+    key: 'normal', name: '普通社畜', tag: '5 分钟 · 标准体验', stars: 2,
+    shift: 300, quota: 300,
+    speed: [92, 210], spawn: [7.5, 11.0], check: [1.25, 1.90],
+    speedRamp: 22, spawnRamp: 0.80, checkRamp: 0.15,
+    doubleFrom: 3.0, doubleChance: 0.16,
+    events: { turnBack: 0.16, ring: 0.22, blackout: 0.14, wave: 0.28 }
+  },
+  hard: {
+    key: 'hard', name: '困难打工人', tag: '5 分钟 · 摸鱼指标 600', stars: 3,
+    shift: 300, quota: 600,
+    speed: [115, 245], spawn: [5.5, 8.5], check: [1.50, 2.20],
+    speedRamp: 26, spawnRamp: 0.95, checkRamp: 0.18,
+    doubleFrom: 1.5, doubleChance: 0.26,
+    events: { turnBack: 0.24, ring: 0.28, blackout: 0.18, wave: 0.24 }
+  }
+};
+
+const ACHS = [
+  { id: 'survivor',     name: '成功下班', desc: '撑到下班且完成摸鱼指标' },
+  { id: 'never_caught', name: '从未被抓', desc: '一局内零被抓' },
+  { id: 'slack_master', name: '摸鱼大师', desc: '单局摸鱼积分达到 800' },
+  { id: 'actor',        name: '影帝',     desc: '一局内 3 次桌面收拾得干干净净' },
+  { id: 'combo',        name: '连击王',   desc: '达成 5 连击' },
+  { id: 'fired',        name: '被开除',   desc: '被抓 3 次或积分归零' }
+];
+
+const SAVE_KEY = 'jiazhuanghenmang.save.v1';
+function loadSave() { try { return JSON.parse(localStorage.getItem(SAVE_KEY)) || {}; } catch (e) { return {}; } }
+function saveSave(o) { try { localStorage.setItem(SAVE_KEY, JSON.stringify(o)); } catch (e) { /* file:// 下可能不可用 */ } }
+
+/* ---------------------------- 全局状态 ---------------------------- */
+const G = {
+  state: 'menu',            // menu | playing | paused | result
+  diffKey: 'normal', cfg: CFG.normal,
+  t: 0, timeLeft: 300,
+  points: 70, catches: 0, combo: 0, maxCombo: 0,
+  success: 0, hiddenCount: 0, doubleHide: 0,
+  screen: 'slack', switchAnim: 0, slackIdx: 0, workIdx: 0, sceneT: 0,
+  items: { noodle: true, phone: true }, calmT: 0,
+  bosses: [], warns: [], spawnTimer: 6, eventTimer: 22,
+  blackout: 0, ring: 0, ringT: 0, wave: null,
+  msgs: [], events: [], buttons: [], shake: 0, flash: 0, frozen: false,
+  outcome: null, reason: '', rating: null, newAchs: [], saved: {},
+  tension: 0
+};
+
+/* ---------------------------- 音效 / BGM ---------------------------- */
+const S = { ctx: null, master: null, muted: false, nextTime: 0, step: 0 };
+
+function audioInit() {
+  if (S.ctx) return;
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    S.ctx = new AC();
+    S.master = S.ctx.createGain();
+    S.master.gain.value = 0.45;
+    S.master.connect(S.ctx.destination);
+    S.nextTime = S.ctx.currentTime + 0.1;
+  } catch (e) { S.ctx = null; }
+}
+function tone(freq, dur, type, vol, slideTo) {
+  if (!S.ctx || S.muted) return;
+  try {
+    const t0 = S.ctx.currentTime;
+    const o = S.ctx.createOscillator(), g = S.ctx.createGain();
+    o.type = type || 'sine';
+    o.frequency.setValueAtTime(freq, t0);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(Math.max(40, slideTo), t0 + dur);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(vol || 0.15, t0 + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g); g.connect(S.master);
+    o.start(t0); o.stop(t0 + dur + 0.03);
+  } catch (e) { }
+}
+function noiseBurst(dur, vol, cutoff) {
+  if (!S.ctx || S.muted) return;
+  try {
+    const t0 = S.ctx.currentTime;
+    const len = Math.max(1, Math.floor(S.ctx.sampleRate * dur));
+    const buf = S.ctx.createBuffer(1, len, S.ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 2);
+    const src = S.ctx.createBufferSource(); src.buffer = buf;
+    const f = S.ctx.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = cutoff || 900;
+    const g = S.ctx.createGain(); g.gain.value = vol || 0.2;
+    src.connect(f); f.connect(g); g.connect(S.master); src.start(t0);
+  } catch (e) { }
+}
+function sfx(name, opt) {
+  opt = opt || {};
+  switch (name) {
+    case 'step':     noiseBurst(0.09, 0.10 * (opt.vol || 1), 340); break;
+    case 'warn':     tone(170, 0.30, 'sine', 0.09, 250); break;
+    case 'switch':   tone(880, 0.05, 'square', 0.09); tone(1320, 0.06, 'square', 0.06); break;
+    case 'click':    tone(700, 0.04, 'square', 0.07); break;
+    case 'success':  tone(660, 0.09, 'triangle', 0.13); window.setTimeout(function () { tone(990, 0.12, 'triangle', 0.11); }, 80); break;
+    case 'catch':    tone(330, 0.20, 'sawtooth', 0.16, 110); noiseBurst(0.25, 0.16, 620); break;
+    case 'oops':     tone(240, 0.12, 'square', 0.10, 145); break;
+    case 'ring':     tone(1180, 0.16, 'square', 0.09); tone(1480, 0.16, 'square', 0.07); break;
+    case 'restore':  tone(520, 0.10, 'triangle', 0.10, 800); break;
+    case 'point':    tone(1040, 0.06, 'triangle', 0.09); break;
+    case 'turnback': tone(300, 0.25, 'sawtooth', 0.10, 520); break;
+    case 'end':      tone(520, 0.20, 'triangle', 0.13); window.setTimeout(function () { tone(392, 0.32, 'triangle', 0.12); }, 170); break;
+  }
+}
+const BGM = { prog: [[220, 262, 330], [175, 220, 262], [196, 247, 294], [165, 208, 247]] };
+function bgmTick() {
+  if (!S.ctx || S.muted) return;
+  try {
+    const tempo = 88 + 46 * G.tension;          // 老板越近，节奏越快
+    const stepDur = 60 / tempo / 2;
+    const now = S.ctx.currentTime;
+    if (S.nextTime < now) S.nextTime = now + 0.05;
+    let guard = 0;
+    while (S.nextTime < now + 0.25 && guard++ < 32) {
+      const chord = BGM.prog[Math.floor(S.step / 8) % BGM.prog.length];
+      const k = S.step % 8;
+      if (k === 0) tone(chord[0] / 2, stepDur * 3.0, 'triangle', 0.09);
+      else if (k === 3 || k === 6) tone(chord[1], stepDur * 1.1, 'triangle', 0.045);
+      else if (k === 2 || k === 5 || k === 7) tone(chord[2], stepDur * 0.7, 'sine', 0.030);
+      if (G.tension > 0.35 && k % 2 === 0) noiseBurst(0.05, 0.02 + 0.03 * G.tension, 3200);
+      S.step++; S.nextTime += stepDur;
+    }
+  } catch (e) { }
+}
+
+/* ============================ 游戏逻辑 ============================ */
+
+function rampStats(m) {                       // m = 已上班分钟数
+  const c = G.cfg;
+  return {
+    speed: Math.min(c.speed[1], c.speed[0] + c.speedRamp * m),
+    check: Math.min(c.check[1], c.check[0] + c.checkRamp * m),
+    spawnMin: Math.max(3.0, c.spawn[0] - c.spawnRamp * m),
+    spawnMax: Math.max(4.2, c.spawn[1] - c.spawnRamp * m),
+    double: (m >= c.doubleFrom) ? Math.min(0.50, c.doubleChance + 0.05 * (m - c.doubleFrom)) : 0
+  };
+}
+function nextInterval() {
+  const s = rampStats(G.t / 60);
+  return rnd(s.spawnMin, Math.max(s.spawnMin + 0.8, s.spawnMax));
+}
+
+function newGame(key) {
+  if (key) G.diffKey = key;
+  G.cfg = CFG[G.diffKey];
+  G.state = 'playing';
+  G.t = 0; G.timeLeft = G.cfg.shift;
+  G.points = 70; G.catches = 0; G.combo = 0; G.maxCombo = 0;
+  G.success = 0; G.hiddenCount = 0; G.doubleHide = 0;
+  G.screen = 'slack'; G.switchAnim = 0; G.slackIdx = 0; G.workIdx = 0; G.sceneT = 0;
+  G.items = { noodle: true, phone: true }; G.calmT = 0;
+  G.bosses = []; G.warns = []; G.spawnTimer = rnd(3.2, 5.0); G.eventTimer = rnd(16, 24);
+  G.blackout = 0; G.ring = 0; G.ringT = 0; G.wave = null;
+  G.msgs = []; G.events = []; G.shake = 0; G.flash = 0; G.frozen = false;
+  G.outcome = null; G.reason = ''; G.rating = null; G.newAchs = [];
+  G.tension = 0; G.saved = loadSave();
+  msg('上班了！老板随时会过来，空格切换屏幕', '#ffd166');
+}
+
+function msg(text, color) {
+  G.msgs.push({ text: text, color: color || '#ffffff', t: 2.4 });
+  if (G.msgs.length > 3) G.msgs.shift();
+}
+function pushEvent(name, opt) { G.events.push({ name: name, opt: opt || {} }); }
+function addPoints(d) {
+  if (G.state !== 'playing') return;
+  G.points = Math.max(0, G.points + d);
+  if (G.points <= 0 && !G.outcome) endGame(true, '摸鱼积分归零');
+}
+
+function doSwitch() {
+  if (G.state !== 'playing') return;
+  if (G.blackout > 0) { msg('停电了，先按 R 重启电脑！', '#ffd166'); pushEvent('oops'); return; }
+  G.screen = (G.screen === 'slack') ? 'work' : 'slack';
+  if (G.screen === 'work') G.workIdx = (G.workIdx + 1) % WORK.length;
+  else G.slackIdx = (G.slackIdx + 1) % SLACK.length;
+  G.switchAnim = 1;
+  pushEvent('switch');
+}
+function hideNoodle() {
+  if (G.state !== 'playing' || !G.items.noodle) return;
+  G.items.noodle = false; G.hiddenCount++;
+  msg('泡面塞进抽屉了', '#9be7a1'); pushEvent('click');
+}
+function hidePhone() {
+  if (G.state !== 'playing' || !G.items.phone) return;
+  G.items.phone = false; G.hiddenCount++;
+  msg('手机塞进口袋了', '#9be7a1'); pushEvent('click');
+}
+function answerPhone() {
+  if (G.state !== 'playing' || G.ring <= 0) return;
+  G.ring = 0; addPoints(5);
+  msg('接起电话：喂，您好！+5', '#9be7a1'); pushEvent('point');
+}
+function restartPC() {
+  if (G.state !== 'playing' || G.blackout <= 0) return;
+  G.blackout = 0;
+  msg('电脑重启完成，屏幕亮了', '#9be7a1'); pushEvent('restore');
+}
+function waveBack() {
+  if (G.state !== 'playing' || !G.wave || G.wave.answered) return;
+  G.wave.answered = true; addPoints(4);
+  msg('跟同事挥了挥手 +4', '#9be7a1'); pushEvent('point');
+}
+
+/* ---------- 出场警告 / 老板生成 ---------- */
+function startWarn(side, delay) {
+  G.warns.push({ side: side, t: -(delay || 0), dur: 1.6, stepT: 0 });
+  pushEvent('warn');
+}
+function updateWarns(dt) {
+  for (let i = G.warns.length - 1; i >= 0; i--) {
+    const w = G.warns[i];
+    w.t += dt; w.stepT -= dt;
+    if (w.t > 0 && w.stepT <= 0) { w.stepT = 0.30; pushEvent('step', { vol: 0.55 }); }
+    if (w.t >= w.dur) { G.warns.splice(i, 1); spawnBoss(w.side); }
+  }
+}
+function spawnBoss(side) {
+  const st = rampStats(G.t / 60);
+  G.bosses.push({
+    side: side, x: side < 0 ? 110 : W - 110, doorX: side < 0 ? 110 : W - 110,
+    stopX: side < 0 ? 500 : W - 320, phase: 'walk', phaseT: 0, walkT: 0, stepT: 0,
+    speed: st.speed * rnd(0.92, 1.08), checkDur: st.check,
+    itemsScored: false, caught: false, turnBackPending: false, turnBackUsed: false,
+    leaveT: 0, angry: 0, lean: 0
+  });
+}
+function updateSpawn(dt) {
+  if (G.state !== 'playing' || G.warns.length) return;
+  G.spawnTimer -= dt;
+  if (G.spawnTimer <= 0 && G.bosses.length < 2) {
+    const st = rampStats(G.t / 60);
+    const side = Math.random() < 0.5 ? -1 : 1;
+    startWarn(side, 0);
+    if (Math.random() < st.double && G.bosses.length === 0) startWarn(-side, 0.45);  // 后期两边同时来
+    G.spawnTimer = nextInterval();
+  }
+}
+
+/* ---------- 老板行为：出现 → 走近 → 停留检查 → 离开 ---------- */
+function caughtBy(b) {
+  b.caught = true; b.angry = 1.8;
+  G.catches++; G.combo = 0; G.shake = 0.65; G.flash = 0.5;
+  pushEvent('catch');
+  msg('被老板抓到了！(-15 分)', '#ff7b7b');
+  addPoints(-15);
+  b.phase = 'leave'; b.leaveT = 0; b.turnBackPending = false;
+  if (G.state === 'playing' && G.catches >= 3) endGame(true, '被抓 3 次');
+}
+function successFor(b) {
+  G.success++; G.combo++;
+  G.maxCombo = Math.max(G.maxCombo, G.combo);
+  const gain = 10 + Math.min(G.combo - 1, 4) * 3;
+  addPoints(gain);
+  pushEvent('success');
+  msg('伪装成功 +' + gain + (G.combo > 1 ? '（连击 ' + G.combo + '）' : ''), '#9be7a1');
+}
+function updateBosses(dt) {
+  for (let i = G.bosses.length - 1; i >= 0; i--) {
+    const b = G.bosses[i];
+    if (b.angry > 0) b.angry -= dt;
+
+    if (b.phase === 'walk') {
+      const dir = sign(b.stopX - b.x);
+      b.x += dir * b.speed * dt; b.walkT += dt;
+      b.lean = lerp(b.lean, 0, Math.min(1, dt * 6));
+      b.stepT -= dt;
+      if (b.stepT <= 0) { b.stepT = 0.32; pushEvent('step', { vol: 0.6 + 0.4 * G.tension }); }
+      if (Math.abs(b.stopX - b.x) < 4) {
+        b.x = b.stopX; b.phase = 'check'; b.phaseT = 0; b.itemsScored = false;
+        pushEvent('arrive');
+      }
+
+    } else if (b.phase === 'check') {
+      b.phaseT += dt; b.lean = lerp(b.lean, 1, Math.min(1, dt * 8));
+      if (!b.itemsScored) {
+        b.itemsScored = true;
+        let pen = 0;
+        if (G.items.noodle) pen += 8;
+        if (G.items.phone) pen += 8;
+        if (pen > 0) {
+          const what = (G.items.noodle && G.items.phone) ? '泡面和手机' : (G.items.noodle ? '泡面' : '手机');
+          addPoints(-pen);
+          pushEvent('oops');
+          msg('老板瞟见了' + what + ' -' + pen, '#ffb4b4');
+        } else {
+          G.doubleHide++;
+          msg('桌面干干净净，老板没话说', '#9be7a1');
+        }
+      }
+      if (!b.caught && G.blackout <= 0 && G.screen === 'slack' && b.phaseT > 0.35) caughtBy(b);
+      if (!b.caught && b.phaseT >= b.checkDur) {
+        if (G.blackout > 0) { msg('屏幕黑着，老板皱了皱眉', '#cfd8e3'); pushEvent('oops'); }
+        else successFor(b);
+        if (G.state !== 'playing') return;
+        b.phase = 'leave'; b.leaveT = 0;
+        const tb = G.cfg.events.turnBack * (1 + 0.45 * (G.t / 60));
+        b.turnBackPending = (!b.turnBackUsed && Math.random() < Math.min(0.45, tb));
+      }
+
+    } else if (b.phase === 'leave') {
+      b.leaveT += dt;
+      b.lean = lerp(b.lean, 0, Math.min(1, dt * 5));
+      const dir = sign(b.doorX - b.x);
+      b.x += dir * b.speed * 1.25 * dt;
+      if (b.turnBackPending && b.leaveT > 0.55) {          // 老板突然回头
+        b.turnBackPending = false; b.turnBackUsed = true;
+        b.phase = 'walk'; b.checkDur = Math.max(0.9, b.checkDur * 0.72);
+        msg('老板突然回头！', '#ff9f43'); pushEvent('turnback');
+      } else if (Math.abs(b.doorX - b.x) < 12 || b.x < -80 || b.x > W + 80) {
+        G.bosses.splice(i, 1);
+      }
+    }
+  }
+}
+
+/* ---------- 随机事件：电话 / 停电 / 同事路过打招呼 ---------- */
+function updateEvents(dt) {
+  if (G.ring > 0) {
+    G.ring -= dt; G.ringT += dt;
+    if (G.ringT > 0.9) { G.ringT = 0; pushEvent('ring'); }
+    if (G.ring <= 0) { G.ring = 0; addPoints(-12); msg('没接电话，被记了一笔 -12', '#ff8f8f'); }
+  }
+  if (G.blackout > 0) {
+    G.blackout -= dt;
+    if (G.blackout <= 0) { G.blackout = 0; msg('来电了，屏幕自己亮了', '#9be7a1'); pushEvent('restore'); }
+  }
+  if (G.wave) {
+    const w = G.wave;
+    w.x += w.dir * 130 * dt; w.t -= dt;
+    if (w.answered) w.waveT += dt;
+    if (w.t <= 0 || w.x < -140 || w.x > W + 140) G.wave = null;
+  }
+  if (G.state !== 'playing') return;
+  if (G.ring > 0 || G.blackout > 0 || G.wave) return;
+  G.eventTimer -= dt;
+  if (G.eventTimer <= 0) {
+    G.eventTimer = rnd(17, 28);
+    const e = G.cfg.events, total = e.ring + e.blackout + e.wave, r = Math.random() * total;
+    if (r < e.ring) { G.ring = 4.0; G.ringT = 0; msg('电话响了！按 P 接听', '#ffd166'); pushEvent('ring'); }
+    else if (r < e.ring + e.blackout) { G.blackout = 4.5; msg('停电了！按 R 重启电脑', '#ffd166'); pushEvent('warn'); }
+    else {
+      const side = Math.random() < 0.5 ? -1 : 1;
+      G.wave = { x: side < 0 ? -70 : W + 70, dir: -side, t: 5.0, answered: false, waveT: 0 };
+      msg('同事路过，按 H 打招呼', '#8fd0ff');
+    }
+  }
+}
+
+/* ---------- 桌面小物件自动复位 / 紧张度 ---------- */
+function updateItems(dt) {
+  const busy = G.bosses.length > 0 || G.warns.length > 0;
+  if (busy) { G.calmT = 0; return; }
+  G.calmT += dt;
+  if (G.calmT > 1.3 && (!G.items.noodle || !G.items.phone)) {
+    G.items.noodle = true; G.items.phone = true;
+    pushEvent('restore');
+    msg('老板走了，泡面和手机又摆了出来', '#8fd0ff');
+  }
+}
+function updateTension() {
+  let t = 0;
+  for (let i = 0; i < G.bosses.length; i++) {
+    const b = G.bosses[i];
+    const near = (b.phase === 'check') ? 1 : clamp(1 - Math.abs(b.x - b.stopX) / 430, 0, 1);
+    t = Math.max(t, near);
+  }
+  if (G.warns.length) t = Math.max(t, 0.35);
+  G.tension = clamp(t, 0, 1);
+}
+
+/* ---------- 评级 / 结算 ---------- */
+function ratingFor(points, catches, outcome) {
+  if (outcome === 'fired') return { title: '被开除', emoji: '📦', color: '#ff7b7b', desc: '工位已清空，明天不用来了。' };
+  if (points >= 800) return { title: '摸鱼大师', emoji: '👑', color: '#ffd166', desc: '老板在你身后站了一整天，什么都没看出来。' };
+  if (points >= 450) return { title: '摸鱼高手', emoji: '😎', color: '#9be7a1', desc: '摸鱼和工作，你掌握了完美的平衡。' };
+  if (points >= 200) return { title: '普通社畜', emoji: '🙂', color: '#8fd0ff', desc: '安全下班，今天也是平平无奇的一天。' };
+  return { title: '摸鱼小白', emoji: '😅', color: '#cfd8e3', desc: '还没摸明白，下班铃就响了。' };
+}
+function endGame(fired, reason) {
+  if (G.outcome) return;
+  G.outcome = fired ? 'fired' : 'survived';
+  G.reason = reason || '';
+  G.state = 'result';
+  G.rating = ratingFor(G.points, G.catches, G.outcome);
+  pushEvent('end');
+
+  const s = loadSave();
+  const newly = [];
+  function unlock(id) {
+    if (!s.achs) s.achs = {};
+    if (!s.achs[id]) { s.achs[id] = 1; newly.push(id); }
+  }
+  if (G.outcome === 'survived' && G.points >= G.cfg.quota) unlock('survivor');
+  if (G.outcome === 'survived' && G.catches === 0) unlock('never_caught');
+  if (G.points >= 800) unlock('slack_master');
+  if (G.doubleHide >= 3) unlock('actor');
+  if (G.maxCombo >= 5) unlock('combo');
+  if (G.outcome === 'fired') unlock('fired');
+  s.best = Math.max(s.best || 0, G.points);
+  s.exp = (s.exp || 0) + G.points;                    // 简化版进程解锁：累计经验
+  s.level = Math.floor(s.exp / 1500) + 1;
+  saveSave(s);
+  G.saved = s;
+  G.newAchs = newly;
+}
+
+/* ---------- 主逻辑步进（与渲染解耦，可无头自测） ---------- */
+function stepGame(dt) {
+  G.sceneT += dt;
+  if (G.shake > 0) G.shake = Math.max(0, G.shake - dt * 2.2);
+  if (G.flash > 0) G.flash = Math.max(0, G.flash - dt * 3.0);
+  for (let i = 0; i < G.msgs.length; i++) G.msgs[i].t -= dt;
+  G.msgs = G.msgs.filter(function (m) { return m.t > 0; });
+
+  if (G.state !== 'playing') return;
+
+  G.t += dt; G.timeLeft -= dt;
+  if (G.switchAnim > 0) G.switchAnim = Math.max(0, G.switchAnim - dt / 0.22);
+
+  updateSpawn(dt);
+  updateWarns(dt);
+  updateBosses(dt);
+  updateEvents(dt);
+  updateItems(dt);
+  updateTension();
+
+  if (G.timeLeft <= 0 && !G.outcome) { G.timeLeft = 0; endGame(false); }
+}
+
+/* ============================ 显示器里的内容 ============================ */
+const MON = { x: 570, y: 240, w: 320, h: 240 };
+const INS = { x: MON.x + 20, y: MON.y + 26, w: MON.w - 40, h: MON.h - 52 };
+
+function drawSnake(t) {
+  rect(INS.x, INS.y, INS.w, INS.h, '#0d1b12');
+  ctx.strokeStyle = 'rgba(120,255,170,.12)'; ctx.lineWidth = 1;
+  for (let x = 0; x <= INS.w; x += 20) { ctx.beginPath(); ctx.moveTo(INS.x + x, INS.y); ctx.lineTo(INS.x + x, INS.y + INS.h); ctx.stroke(); }
+  for (let y = 0; y <= INS.h; y += 20) { ctx.beginPath(); ctx.moveTo(INS.x, INS.y + y); ctx.lineTo(INS.x + INS.w, INS.y + y); ctx.stroke(); }
+  const head = (Math.sin(t * 1.6) * 0.5 + 0.5) * (INS.w - 80) + 20;
+  for (let i = 6; i >= 0; i--) {
+    circle(INS.x + head - i * 18, INS.y + 96 + Math.sin(t * 3 + i * 0.6) * 26, 8, i === 0 ? '#7dff9b' : 'rgba(125,255,155,' + (0.85 - i * 0.1) + ')');
+  }
+  circle(INS.x + 30, INS.y + 30, 7, '#ff6b6b');
+  txt('SCORE ' + (120 + Math.floor(t * 3)), INS.x + 46, INS.y + 34, 12, '#7dff9b');
+}
+function drawVideo(t) {
+  rect(INS.x, INS.y, INS.w, INS.h, '#140d16');
+  rect(INS.x + 10, INS.y + 10, INS.w - 20, INS.h - 44, '#241a2b');
+  for (let i = 0; i < 5; i++) {
+    const h = 20 + Math.abs(Math.sin(t * 3 + i)) * 60;
+    rect(INS.x + 40 + i * 40, INS.y + INS.h - 60 - h, 22, h, 'rgba(255,110,190,.75)');
+  }
+  circle(INS.x + INS.w / 2, INS.y + 58, 26 + Math.sin(t * 6) * 3, 'rgba(255,207,110,.9)');
+  rect(INS.x + 10, INS.y + INS.h - 28, INS.w - 20, 8, '#3a2b42');
+  rect(INS.x + 10, INS.y + INS.h - 28, (INS.w - 20) * ((t * 0.16) % 1), 8, '#ffd166');
+  txt('搞笑视频合集.mp4', INS.x + 14, INS.y + 30, 13, '#ffd6f0');
+}
+function drawChat(t) {
+  rect(INS.x, INS.y, INS.w, INS.h, '#e9f1f7');
+  rect(INS.x, INS.y, INS.w, 26, '#2f7fd0');
+  txt('小王（同事）', INS.x + 10, INS.y + 18, 13, '#fff');
+  const bubbles = ['在吗？老板刚下楼', '看到你屏幕了 hhh', '晚上开黑？'];
+  for (let i = 0; i < bubbles.length; i++) {
+    const y = INS.y + 40 + i * 34;
+    rr(INS.x + 14, y, INS.w - 60, 26, 8); ctx.fillStyle = i % 2 ? '#d6e8ff' : '#ffffff'; ctx.fill();
+    txt(bubbles[i], INS.x + 22, y + 18, 12, '#31506b');
+  }
+  const dots = 1 + Math.floor((t * 2) % 3);
+  rr(INS.x + 14, INS.y + INS.h - 34, 46, 24, 8); ctx.fillStyle = '#ffffff'; ctx.fill();
+  for (let i = 0; i < dots; i++) circle(INS.x + 26 + i * 10, INS.y + INS.h - 22, 3, '#7aa7cc');
+}
+function drawShop(t) {
+  rect(INS.x, INS.y, INS.w, INS.h, '#fff6f2');
+  rect(INS.x, INS.y, INS.w, 24, '#ff8a5c');
+  txt('限时秒杀 · 摸鱼也要买', INS.x + 10, INS.y + 17, 12, '#fff');
+  const items = [['🍜', '泡面'], ['☕', '咖啡'], ['🧸', '抱枕'], ['🎧', '耳机']];
+  for (let i = 0; i < items.length; i++) {
+    const cx = INS.x + 40 + (i % 2) * 140, cy = INS.y + 60 + Math.floor(i / 2) * 66;
+    rr(cx - 30, cy - 26, 60, 52, 8); ctx.fillStyle = '#ffffff'; ctx.fill();
+    txt(items[i][0], cx, cy + 6, 22, '#333', 'center');
+    txt(items[i][1] + ' ¥' + (9 + i * 7), cx, cy + 26, 11, '#ff6b6b', 'center');
+  }
+}
+function drawExcel(t) {
+  rect(INS.x, INS.y, INS.w, INS.h, '#f7fbf7');
+  rect(INS.x, INS.y, INS.w, 22, '#1d6f42');
+  txt('季度销售报表.xlsx', INS.x + 8, INS.y + 16, 12, '#fff');
+  const cols = 6, rows = 6, cw = (INS.w - 16) / cols, chh = (INS.h - 40) / rows;
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+    const x = INS.x + 8 + c * cw, y = INS.y + 30 + r * chh;
+    ctx.strokeStyle = '#d3e3d6'; ctx.lineWidth = 1; ctx.strokeRect(x, y, cw, chh);
+    if (r > 0) txt(String((r * 37 + c * 13) % 97), x + 6, y + chh - 5, 11, '#31704a');
+  }
+  const sel = Math.floor(t * 1.6) % (rows - 1) + 1;
+  ctx.strokeStyle = '#1d6f42'; ctx.lineWidth = 2;
+  ctx.strokeRect(INS.x + 8 + 2 * cw, INS.y + 30 + sel * chh, cw, chh);
+  for (let i = 0; i < 4; i++) rect(INS.x + INS.w - 60, INS.y + INS.h - 30 - i * 16, 10 + i * 9, 12, '#5fbf85');
+}
+function drawWord(t) {
+  rect(INS.x, INS.y, INS.w, INS.h, '#ffffff');
+  rect(INS.x, INS.y, INS.w, 22, '#2b5797');
+  txt('季度总结报告.docx', INS.x + 8, INS.y + 16, 12, '#fff');
+  for (let i = 0; i < 7; i++) {
+    const w = (i === 0) ? 150 : (120 + ((i * 53) % 120));
+    rect(INS.x + 16, INS.y + 38 + i * 20, w, 7, i === 0 ? '#2b5797' : '#c9d4e3');
+  }
+  if (Math.floor(t * 2) % 2 === 0) rect(INS.x + 136, INS.y + 166, 2, 10, '#2b5797');
+  txt('第 3 季度 · 已完成 87%', INS.x + 16, INS.y + INS.h - 10, 11, '#8aa0bb');
+}
+function drawCode(t) {
+  rect(INS.x, INS.y, INS.w, INS.h, '#12161d');
+  rect(INS.x, INS.y, INS.w, 20, '#1f2733');
+  txt('main.js', INS.x + 8, INS.y + 15, 11, '#9fb3c8');
+  const lines = [
+    ['const', ' boss', ' = spawn();'],
+    ['if', ' (screen === ', "'work'", ') {'],
+    ['  points', ' += ', '10;'],
+    ['} else', ' {', ''],
+    ['  caught', '();', ''],
+    ['}', '', '']
+  ];
+  const colors = ['#ff79c6', '#8be9fd', '#f1fa8c'];
+  for (let i = 0; i < lines.length; i++) {
+    let x = INS.x + 16;
+    for (let j = 0; j < lines[i].length; j++) {
+      txt(lines[i][j], x, INS.y + 44 + i * 20, 12, colors[j]);
+      x += ctx.measureText(lines[i][j]).width;
+    }
+  }
+  rect(INS.x + 16, INS.y + 30 + Math.floor((t * 2) % (INS.h - 30)) * 0.5, 2, 12, '#8be9fd');
+}
+function drawMail(t) {
+  rect(INS.x, INS.y, INS.w, INS.h, '#f4f7fb');
+  rect(INS.x, INS.y, INS.w, 22, '#444b57');
+  txt('收件箱 (3)', INS.x + 8, INS.y + 16, 12, '#fff');
+  const mails = ['【重要】明天早会 9:00', '关于报销流程的通知', '团建报名表（附链接）'];
+  for (let i = 0; i < mails.length; i++) {
+    const y = INS.y + 34 + i * 30;
+    rr(INS.x + 10, y, INS.w - 20, 26, 6); ctx.fillStyle = '#ffffff'; ctx.fill();
+    circle(INS.x + 24, y + 13, 7, i === 0 ? '#ff9f43' : '#c3cfdd');
+    txt(mails[i], INS.x + 38, y + 17, 11, '#41506b');
+  }
+  txt('未读 ' + (1 + Math.floor((t * 0.5) % 3)), INS.x + INS.w - 60, INS.y + INS.h - 8, 11, '#ff6b6b');
+}
+const SLACK = [{ name: '贪吃蛇', draw: drawSnake }, { name: '搞笑视频', draw: drawVideo },
+               { name: '摸鱼聊天', draw: drawChat }, { name: '网上购物', draw: drawShop }];
+const WORK  = [{ name: 'Excel 报表', draw: drawExcel }, { name: '季度报告', draw: drawWord },
+               { name: '代码编辑器', draw: drawCode }, { name: '邮件', draw: drawMail }];
+
+/* ============================ 绘制：办公室场景 ============================ */
+const FLOOR_Y = 500, DESK_TOP = 470, LANE_Y = 470;
+
+function drawRoom() {
+  const g = ctx.createLinearGradient(0, 0, 0, FLOOR_Y);
+  g.addColorStop(0, '#eaf1f9'); g.addColorStop(1, '#cddbea');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, FLOOR_Y);
+  ctx.strokeStyle = 'rgba(120,142,170,.16)'; ctx.lineWidth = 2;
+  for (let x = 0; x <= W; x += 80) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, FLOOR_Y); ctx.stroke(); }
+
+  const fg = ctx.createLinearGradient(0, FLOOR_Y, 0, H);
+  fg.addColorStop(0, '#c9a377'); fg.addColorStop(1, '#9a7752');
+  ctx.fillStyle = fg; ctx.fillRect(0, FLOOR_Y, W, H - FLOOR_Y);
+  rect(0, FLOOR_Y - 10, W, 12, '#b08e66');
+  ctx.strokeStyle = 'rgba(90,60,30,.16)'; ctx.lineWidth = 1.5;
+  for (let i = -8; i <= 16; i++) { ctx.beginPath(); ctx.moveTo(640 + i * 55, FLOOR_Y); ctx.lineTo(640 + i * 150, H); ctx.stroke(); }
+  for (let y = FLOOR_Y + 30; y < H; y += 40) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+
+  drawWindow(210, 96, 230, 168);
+  drawClock(760, 104, 42);
+  drawPoster(872, 130, 170, 200);
+  drawPlant(300, FLOOR_Y);
+  drawDoor(18, 176, 132, 324, '老板办公室');
+  drawDoor(W - 150, 176, 132, 324, '会议室');
+}
+function drawWindow(x, y, w, h) {
+  rect(x - 8, y - 8, w + 16, h + 16, '#b9c8da');
+  const sky = ctx.createLinearGradient(0, y, 0, y + h);
+  sky.addColorStop(0, '#8fc7f5'); sky.addColorStop(1, '#dceaf7');
+  ctx.fillStyle = sky; ctx.fillRect(x, y, w, h);
+  circle(x + w - 52, y + 44, 22, 'rgba(255,226,140,.95)');
+  for (let i = 0; i < 4; i++) rect(x + 16 + i * 54, y + h - 62 - (i % 3) * 22, 34, 62 + (i % 3) * 22, 'rgba(120,150,185,.55)');
+  ctx.strokeStyle = '#b9c8da'; ctx.lineWidth = 7;
+  ctx.beginPath(); ctx.moveTo(x + w / 2, y); ctx.lineTo(x + w / 2, y + h); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x, y + h / 2); ctx.lineTo(x + w, y + h / 2); ctx.stroke();
+  const bx = x + 30 + ((G.sceneT * 26) % (w - 60));
+  ctx.strokeStyle = '#5b7794'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(bx - 8, y + 30); ctx.quadraticCurveTo(bx, y + 20, bx + 8, y + 30); ctx.stroke();
+}
+function clockText() {
+  const prog = 1 - clamp(G.timeLeft / G.cfg.shift, 0, 1);
+  const tmin = 9 * 60 + prog * 9 * 60;
+  const hh = Math.floor(tmin / 60), mm = Math.floor(tmin % 60);
+  return hh + ':' + (mm < 10 ? '0' + mm : mm);
+}
+function drawClock(cx, cy, r) {
+  circle(cx, cy, r + 6, '#8fa2b8');
+  circle(cx, cy, r, '#fdfefe');
+  ctx.strokeStyle = '#5c6b7d'; ctx.lineWidth = 2;
+  for (let i = 0; i < 12; i++) {
+    const a = i * Math.PI / 6;
+    ctx.beginPath();
+    ctx.moveTo(cx + Math.sin(a) * (r - 10), cy - Math.cos(a) * (r - 10));
+    ctx.lineTo(cx + Math.sin(a) * (r - 4), cy - Math.cos(a) * (r - 4));
+    ctx.stroke();
+  }
+  const prog = 1 - clamp(G.timeLeft / G.cfg.shift, 0, 1);
+  const tmin = 9 * 60 + prog * 9 * 60;
+  const hAng = ((tmin / 60) % 12) * Math.PI / 6, mAng = (tmin % 60) * Math.PI / 30;
+  ctx.strokeStyle = '#22303c'; ctx.lineWidth = 4; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + Math.sin(hAng) * r * 0.5, cy - Math.cos(hAng) * r * 0.5); ctx.stroke();
+  ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + Math.sin(mAng) * r * 0.72, cy - Math.cos(mAng) * r * 0.72); ctx.stroke();
+  circle(cx, cy, 3, '#e0523f');
+  txt(clockText(), cx, cy + r + 26, 15, '#43556b', 'center', 'bold');
+}
+function drawPoster(x, y, w, h) {
+  rr(x, y, w, h, 6); ctx.fillStyle = '#fdf6e3'; ctx.fill();
+  ctx.strokeStyle = '#d9cbb0'; ctx.lineWidth = 3; ctx.stroke();
+  txt('本月 KPI', x + w / 2, y + 40, 20, '#c0562f', 'center', 'bold');
+  for (let i = 0; i < 4; i++) rect(x + 24 + i * 32, y + 150 - (30 + i * 26), 22, 30 + i * 26, i === 3 ? '#e0523f' : '#8fb9d8');
+  txt('加油！', x + w / 2, y + 182, 16, '#c0562f', 'center');
+}
+function drawPlant(x, base) {
+  rect(x - 26, base - 46, 52, 46, '#c96f4a');
+  rr(x - 30, base - 52, 60, 12, 4); ctx.fillStyle = '#b25f3c'; ctx.fill();
+  ctx.fillStyle = '#4f9e5f';
+  for (let i = -2; i <= 2; i++) {
+    ctx.save(); ctx.translate(x, base - 52); ctx.rotate(i * 0.36 + Math.sin(G.sceneT + i) * 0.03);
+    ctx.beginPath(); ctx.ellipse(0, -40, 12, 44, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+}
+function drawDoor(x, y, w, h, label) {
+  rect(x - 6, y - 8, w + 12, h + 14, '#a9855f');
+  const dg = ctx.createLinearGradient(x, y, x + w, y);
+  dg.addColorStop(0, '#8d5f3c'); dg.addColorStop(0.5, '#a57047'); dg.addColorStop(1, '#82552f');
+  ctx.fillStyle = dg; ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = 'rgba(60,35,15,.35)'; ctx.lineWidth = 2;
+  ctx.strokeRect(x + 12, y + 16, w - 24, h * 0.42);
+  ctx.strokeRect(x + 12, y + 16 + h * 0.48, w - 24, h * 0.42);
+  circle(x + w - 20, y + h * 0.52, 5, '#e8c877');
+  rr(x - 10, y - 40, w + 20, 26, 6); ctx.fillStyle = '#2f6f4f'; ctx.fill();
+  txt(label, x + w / 2, y - 22, 14, '#eafff2', 'center', 'bold');
+}
+
+/* ---------------- 桌子 / 显示器 / 玩家 / 老板 ---------------- */
+function drawDesk() {
+  const dg = ctx.createLinearGradient(0, DESK_TOP, 0, DESK_TOP + 24);
+  dg.addColorStop(0, '#d8a979'); dg.addColorStop(1, '#bd8a58');
+  ctx.fillStyle = dg; ctx.fillRect(330, DESK_TOP, 620, 26);
+  rect(330, DESK_TOP + 26, 620, 8, '#a8763f');
+  rect(346, DESK_TOP + 34, 16, H - DESK_TOP - 60, '#9d6c39');
+  rect(918, DESK_TOP + 34, 16, H - DESK_TOP - 60, '#9d6c39');
+  rect(360, DESK_TOP + 40, 560, 90, '#b07c47');
+  ctx.strokeStyle = 'rgba(80,50,20,.28)'; ctx.lineWidth = 2;
+  ctx.strokeRect(388, DESK_TOP + 58, 210, 54);
+  ctx.strokeRect(622, DESK_TOP + 58, 210, 54);
+  circle(593, DESK_TOP + 85, 6, '#e8c877');
+  circle(827, DESK_TOP + 85, 6, '#e8c877');
+}
+function drawDeskItems() {
+  // 键盘
+  rr(636, 484, 190, 26, 6); ctx.fillStyle = '#333c47'; ctx.fill();
+  const typing = (G.screen === 'work');
+  for (let r = 0; r < 2; r++) for (let c = 0; c < 10; c++) {
+    const lit = typing && ((Math.floor(G.sceneT * 12) + r * 3 + c) % 7 === 0);
+    rect(644 + c * 18, 489 + r * 10, 14, 8, lit ? '#9be7a1' : '#4a5765');
+  }
+  // 鼠标
+  ctx.beginPath(); ctx.ellipse(848, 496, 15, 21, 0, 0, Math.PI * 2);
+  ctx.fillStyle = '#3b4652'; ctx.fill();
+  rect(844, 484, 8, 4, '#7f8c9b');
+  // 咖啡杯（放在显示器左侧，避免挡住屏幕）
+  rr(492, 452, 34, 34, 5); ctx.fillStyle = '#f2f2f2'; ctx.fill();
+  ctx.strokeStyle = '#cfd6dd'; ctx.lineWidth = 3; ctx.stroke();
+  ctx.beginPath(); ctx.arc(528, 466, 10, -1.2, 1.2); ctx.stroke();
+  if (G.screen === 'slack') {
+    ctx.strokeStyle = 'rgba(255,255,255,.65)'; ctx.lineWidth = 2;
+    for (let i = 0; i < 2; i++) {
+      const off = ((G.sceneT * 30 + i * 20) % 40);
+      ctx.beginPath(); ctx.moveTo(502 + i * 12, 448 - off); ctx.lineTo(502 + i * 12, 440 - off); ctx.stroke();
+    }
+  }
+  // 泡面
+  if (G.items.noodle) {
+    rr(414, 424, 62, 58, 6); ctx.fillStyle = '#f5e0b0'; ctx.fill();
+    ctx.strokeStyle = '#d8b46a'; ctx.lineWidth = 2; ctx.stroke();
+    rect(414, 440, 62, 8, '#e2523f');
+    ctx.beginPath(); ctx.ellipse(445, 428, 30, 8, 0, 0, Math.PI * 2); ctx.fillStyle = '#f7d78a'; ctx.fill();
+    ctx.strokeStyle = '#b98a3e'; ctx.lineWidth = 2;
+    for (let i = 0; i < 3; i++) { ctx.beginPath(); ctx.moveTo(428 + i * 14, 430); ctx.lineTo(436 + i * 14, 420); ctx.stroke(); }
+    if (G.screen === 'slack') {
+      ctx.strokeStyle = 'rgba(255,255,255,.6)';
+      for (let i = 0; i < 2; i++) {
+        const off = ((G.sceneT * 26 + i * 22) % 36);
+        ctx.beginPath(); ctx.moveTo(436 + i * 16, 416 - off); ctx.lineTo(436 + i * 16, 408 - off); ctx.stroke();
+      }
+    }
+  } else {
+    rr(414, 452, 62, 30, 4); ctx.fillStyle = 'rgba(70,50,30,.35)'; ctx.fill();
+    txt('泡面已藏', 445, 472, 12, '#ffe9c9', 'center');
+  }
+  // 手机（放在显示器右侧，避免挡住屏幕）
+  if (G.items.phone) {
+    rr(900, 424, 34, 58, 6); ctx.fillStyle = '#26313d'; ctx.fill();
+    rect(905, 432, 24, 42, G.screen === 'slack' ? '#7fd0ff' : '#2a3644');
+    if (G.screen === 'slack') txt('🐟', 917, 460, 14, '#0b1016', 'center');
+  } else {
+    rr(892, 452, 62, 30, 4); ctx.fillStyle = 'rgba(30,50,70,.35)'; ctx.fill();
+    txt('手机已收', 923, 472, 12, '#d7ecff', 'center');
+  }
+  // 便签 + 笔筒
+  ctx.save(); ctx.translate(352, 448); ctx.rotate(-0.08);
+  rect(0, 0, 44, 40, '#fff3a8'); ctx.restore();
+  txt('18:00 下班', 356, 476, 10, '#8a6d1f');
+  rr(954, 440, 34, 42, 5); ctx.fillStyle = '#5b6b7c'; ctx.fill();
+  ctx.strokeStyle = '#ffd166'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(962, 440); ctx.lineTo(956, 414); ctx.stroke();
+  ctx.strokeStyle = '#ff8a5c';
+  ctx.beginPath(); ctx.moveTo(972, 440); ctx.lineTo(976, 412); ctx.stroke();
+}
+function drawPlayerBehind() {
+  rr(636, 300, 200, 190, 16); ctx.fillStyle = '#3f4c5c'; ctx.fill();   // 椅背
+  rr(652, 316, 168, 160, 12); ctx.fillStyle = '#4c5a6b'; ctx.fill();
+  rr(628, 250, 216, 90, 26); ctx.fillStyle = '#5c86c4'; ctx.fill();    // 肩膀
+  const headY = 192;
+  circle(736, headY, 46, '#f6d3ac');
+  ctx.beginPath(); ctx.arc(736, headY - 4, 46, Math.PI * 1.02, Math.PI * 1.98); ctx.fillStyle = '#3b342e'; ctx.fill();
+  circle(690, headY + 6, 8, '#eec49a');
+  circle(782, headY + 6, 8, '#eec49a');
+  if (G.tension > 0.5 && G.screen === 'slack') txt('💦', 800, headY - 22, 20 + G.tension * 6, '#7fd0ff', 'center');
+  if (G.screen === 'work' && G.tension > 0.5) txt('🧐', 800, headY - 22, 20, '#ffffff', 'center');
+}
+function drawHands() {
+  const bob = Math.sin(G.sceneT * 12) * 2;
+  if (G.screen === 'work') {
+    rr(658, 500 + bob, 46, 26, 10); ctx.fillStyle = '#f6d3ac'; ctx.fill();
+    rr(760, 500 - bob, 46, 26, 10); ctx.fillStyle = '#f6d3ac'; ctx.fill();
+  } else {
+    rr(836, 502, 46, 26, 10); ctx.fillStyle = '#f6d3ac'; ctx.fill();               // 鼠标上的手
+    rr(636, 196 + bob * 0.5, 40, 50, 10); ctx.fillStyle = '#f6d3ac'; ctx.fill();   // 举着手机的手
+    rr(644, 168, 26, 44, 6); ctx.fillStyle = '#26313d'; ctx.fill();
+    rect(648, 174, 18, 30, '#7fd0ff');
+  }
+}
+function drawMonitor() {
+  rect(700, 480, 80, 26, '#39424e');
+  rect(656, 502, 168, 14, '#2f3742');
+  rr(MON.x - 16, MON.y - 16, MON.w + 32, MON.h + 32, 14); ctx.fillStyle = '#28313b'; ctx.fill();
+  rr(MON.x - 8, MON.y - 8, MON.w + 16, MON.h + 16, 10);
+  ctx.fillStyle = G.screen === 'work' ? '#3c4a5d' : '#50412f'; ctx.fill();
+
+  const off = G.switchAnim * 70;
+  ctx.save();
+  ctx.beginPath(); ctx.rect(INS.x, INS.y, INS.w, INS.h); ctx.clip();
+  if (G.blackout > 0) {
+    rect(INS.x, INS.y, INS.w, INS.h, '#05070a');
+    if (Math.floor(G.sceneT * 3) % 2 === 0) txt('无信号…按 R 重启电脑', INS.x + INS.w / 2, INS.y + INS.h / 2, 14, '#5d6d7e', 'center');
+  } else {
+    ctx.save();
+    ctx.translate(G.screen === 'work' ? off : -off, 0);
+    ((G.screen === 'work') ? WORK[G.workIdx] : SLACK[G.slackIdx]).draw(G.sceneT);
+    ctx.restore();
+    ctx.fillStyle = (G.screen === 'work') ? 'rgba(120,170,255,.10)' : 'rgba(255,190,90,.12)';
+    ctx.fillRect(INS.x, INS.y, INS.w, INS.h);
+    if (G.switchAnim > 0) { ctx.fillStyle = 'rgba(255,255,255,' + (G.switchAnim * 0.55) + ')'; ctx.fillRect(INS.x, INS.y, INS.w, INS.h); }
+  }
+  rect(INS.x, INS.y + INS.h - 20, INS.w, 20, 'rgba(10,14,20,.72)');
+  const label = G.blackout > 0 ? '停电中…'
+    : (G.screen === 'work' ? '认真工作中 · ' + WORK[G.workIdx].name : '摸鱼中 · ' + SLACK[G.slackIdx].name);
+  txt(label, INS.x + 8, INS.y + INS.h - 6, 12, G.screen === 'work' ? '#9be7a1' : '#ffd166');
+  ctx.restore();
+  circle(MON.x + MON.w + 8, MON.y + MON.h + 8, 4, G.blackout > 0 ? '#4a5560' : (G.screen === 'work' ? '#5fd0ff' : '#ffd166'));
+}
+function drawBosses() {
+  for (let i = 0; i < G.bosses.length; i++) {
+    const b = G.bosses[i];
+    const facing = sign(b.stopX - b.x) || sign(b.stopX - 640);
+    const walking = (b.phase === 'walk' || b.phase === 'leave');
+    const swing = walking ? Math.sin(b.walkT * 9) : 0;
+    const lean = b.lean * 14;
+    const x = b.x, y = LANE_Y;
+    ctx.save();
+    ctx.translate(x + facing * lean, -lean * 0.4);
+    ctx.beginPath(); ctx.ellipse(0, 2, 42, 10, 0, 0, Math.PI * 2); ctx.fillStyle = 'rgba(40,30,20,.22)'; ctx.fill();
+    rect(-20 + swing * 10, y - 62, 16, 62, '#2c3440');
+    rect(6 - swing * 10, y - 62, 16, 62, '#333c49');
+    rect(-22 + swing * 10, y - 12, 40, 12, '#1d232c');
+    rect(4 - swing * 10, y - 12, 40, 12, '#232a34');
+    rr(-34, y - 148, 68, 92, 12); ctx.fillStyle = b.angry > 0 ? '#8c2f2f' : '#3d4a5c'; ctx.fill();
+    ctx.beginPath(); ctx.moveTo(-34, y - 148); ctx.lineTo(0, y - 96); ctx.lineTo(34, y - 148); ctx.closePath();
+    ctx.fillStyle = '#ffffff'; ctx.fill();
+    ctx.beginPath(); ctx.moveTo(-12, y - 148); ctx.lineTo(0, y - 120); ctx.lineTo(12, y - 148); ctx.closePath();
+    ctx.fillStyle = b.angry > 0 ? '#ffd166' : '#c0392b'; ctx.fill();
+    rect(facing > 0 ? 26 : -42, y - 140, 16, 70, '#3d4a5c');
+    rect(facing > 0 ? -42 : 26, y - 140, 16, 70, '#35414f');
+    rect(facing > 0 ? -58 : 42, y - 86, 30, 22, '#8a6a45');
+    const hy = y - 178;
+    circle(facing * 3, hy, 30, '#f3c9a0');
+    ctx.beginPath(); ctx.arc(facing * 3, hy - 4, 30, Math.PI * 1.02, Math.PI * 1.98); ctx.fillStyle = '#e8e2d8'; ctx.fill();
+    circle(facing * 3 - 28, hy + 2, 7, '#efc59c'); circle(facing * 3 + 28, hy + 2, 7, '#efc59c');
+    const ex = facing * 2.4;
+    circle(facing * 3 - 9 + ex, hy - 2, b.angry > 0 ? 5 : 3.4, '#22303c');
+    circle(facing * 3 + 9 + ex, hy - 2, b.angry > 0 ? 5 : 3.4, '#22303c');
+    ctx.strokeStyle = '#3a2b22'; ctx.lineWidth = 3; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(facing * 3 - 16, hy - 12); ctx.lineTo(facing * 3 - 3, hy - 7 + (b.angry > 0 ? 3 : 0)); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(facing * 3 + 16, hy - 12); ctx.lineTo(facing * 3 + 3, hy - 7 + (b.angry > 0 ? 3 : 0)); ctx.stroke();
+    ctx.beginPath();
+    if (b.angry > 0) { ctx.arc(facing * 3, hy + 20, 11, Math.PI, Math.PI * 2); ctx.stroke(); }
+    else if (b.phase === 'check') { ctx.moveTo(facing * 3 - 10, hy + 14); ctx.lineTo(facing * 3 + 10, hy + 14); ctx.stroke(); }
+    else { ctx.arc(facing * 3, hy + 8, 10, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke(); }
+    if (b.phase === 'check' && b.angry <= 0) txt('🧐', facing * 3 + facing * 46, hy - 34, 24, '#ffffff', 'center');
+    if (b.angry > 0) {
+      txt('💢', facing * 3 + facing * 40, hy - 42, 26, '#ff6b6b', 'center');
+      txt('!', facing * 3, hy - 46, 28, '#ff3b3b', 'center', 'bold');
+    }
+    ctx.restore();
+  }
+}
+function drawColleague() {
+  if (!G.wave) return;
+  const w = G.wave;
+  const bob = Math.sin(G.sceneT * 10) * 3;
+  ctx.save();
+  ctx.translate(w.x, LANE_Y);
+  ctx.beginPath(); ctx.ellipse(0, 2, 30, 8, 0, 0, Math.PI * 2); ctx.fillStyle = 'rgba(40,30,20,.18)'; ctx.fill();
+  rect(-14, -52, 12, 52, '#4a5568'); rect(2, -52, 12, 52, '#556074');
+  rr(-24, -118, 48, 70, 10); ctx.fillStyle = '#78a06a'; ctx.fill();
+  const hy = -142 + bob;
+  circle(0, hy, 22, '#f3c9a0');
+  ctx.beginPath(); ctx.arc(0, hy - 3, 22, Math.PI * 1.04, Math.PI * 1.96); ctx.fillStyle = '#4a3a2c'; ctx.fill();
+  circle(-7, hy - 2, 2.6, '#22303c'); circle(7, hy - 2, 2.6, '#22303c');
+  ctx.strokeStyle = '#3a2b22'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(0, hy + 6, 7, 0.1 * Math.PI, 0.9 * Math.PI); ctx.stroke();
+  if (w.answered) {
+    ctx.save(); ctx.translate(24, -108); ctx.rotate(Math.sin(G.sceneT * 14) * 0.5);
+    rect(0, 0, 10, 34, '#f3c9a0'); ctx.restore();
+  }
+  rr(-30, -104, 18, 24, 4); ctx.fillStyle = '#ffffff'; ctx.fill();
+  ctx.restore();
+  txt(w.answered ? '同事：👋' : '同事路过…', w.x, LANE_Y - 176, 14, '#33475e', 'center');
+}
+
+/* ---------------- 覆盖层 / HUD / 按钮 ---------------- */
+function drawWarnings() {
+  for (let i = 0; i < G.warns.length; i++) {
+    const w = G.warns[i];
+    if (w.t < 0) continue;
+    const a = clamp(w.t / w.dur, 0, 1);
+    const fromLeft = w.side < 0;
+    const g = ctx.createLinearGradient(fromLeft ? 0 : W, 0, fromLeft ? 260 : W - 260, 0);
+    g.addColorStop(0, 'rgba(20,20,30,' + (0.34 * (1 - a * 0.5)) + ')');
+    g.addColorStop(1, 'rgba(20,20,30,0)');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+    const baseX = fromLeft ? 40 : W - 40;
+    for (let k = 0; k < 3; k++) {
+      const alpha = 0.25 + 0.5 * ((Math.sin(G.sceneT * 8 - k) + 1) / 2);
+      ctx.save();
+      ctx.translate(baseX + (fromLeft ? k * 26 : -k * 26), 360);
+      ctx.fillStyle = 'rgba(255,209,102,' + alpha + ')';
+      ctx.beginPath();
+      ctx.moveTo(0, -24); ctx.lineTo(fromLeft ? 20 : -20, 0); ctx.lineTo(0, 24); ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+    txt('脚步声…', fromLeft ? 120 : W - 120, 300, 20, '#ffd166', 'center', 'bold');
+  }
+}
+function drawVignette() {
+  const t = G.tension;
+  if (t <= 0.02) return;
+  const pulse = 0.75 + 0.25 * Math.sin(G.sceneT * 9);
+  const g = ctx.createRadialGradient(640, 380, 260, 640, 380, 760);
+  g.addColorStop(0, 'rgba(255,40,40,0)');
+  g.addColorStop(1, 'rgba(255,40,40,' + (t * 0.42 * pulse) + ')');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  if (G.flash > 0) { ctx.fillStyle = 'rgba(255,60,60,' + (G.flash * 0.35) + ')'; ctx.fillRect(0, 0, W, H); }
+}
+function bar(x, y, w, h, p, bg, fg) {
+  rr(x, y, w, h, h / 2); ctx.fillStyle = bg; ctx.fill();
+  if (p > 0) { rr(x, y, Math.max(4, w * clamp(p, 0, 1)), h, h / 2); ctx.fillStyle = fg; ctx.fill(); }
+}
+function drawHUD() {
+  if (G.state !== 'playing' && G.state !== 'paused') return;
+  rr(16, 12, W - 32, 62, 12); ctx.fillStyle = 'rgba(12,20,30,.82)'; ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,.08)'; ctx.lineWidth = 2; ctx.stroke();
+
+  const prog = 1 - clamp(G.timeLeft / G.cfg.shift, 0, 1);
+  txt('距离下班', 40, 38, 13, '#8fa6bd');
+  const left = Math.max(0, G.timeLeft);
+  const mm = Math.floor(left / 60), ss = Math.floor(left % 60);
+  txt(mm + ':' + (ss < 10 ? '0' + ss : ss), 40, 64, 26, '#ffd166', 'left', 'bold');
+  bar(150, 50, 230, 12, prog, 'rgba(255,255,255,.14)', '#5fd0ff');
+  txt('现在 ' + clockText(), 150, 38, 13, '#8fa6bd');
+
+  txt('摸鱼积分', 452, 38, 13, '#8fa6bd');
+  txt(String(G.points), 452, 68, 30, '#9be7a1', 'left', 'bold');
+  if (G.combo > 1) txt('连击 x' + G.combo, 556, 64, 18, '#ffd166', 'left', 'bold');
+
+  txt('被抓次数', 730, 38, 13, '#8fa6bd');
+  for (let i = 0; i < 3; i++) {
+    const cx = 744 + i * 34;
+    if (i < G.catches) txt('✖', cx, 68, 26, '#ff6b6b', 'center', 'bold');
+    else txt('♥', cx, 66, 24, '#5d6d7e', 'center');
+  }
+  txt('目标 ' + G.cfg.quota + ' 分', 900, 38, 13, '#8fa6bd');
+  txt(G.points >= G.cfg.quota ? '指标已达标 ✓' : '还差 ' + (G.cfg.quota - G.points) + ' 分', 900, 66, 18,
+      G.points >= G.cfg.quota ? '#9be7a1' : '#ffd166');
+
+  rr(16, 630, W - 32, 78, 12); ctx.fillStyle = 'rgba(12,20,30,.82)'; ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,.08)'; ctx.lineWidth = 2; ctx.stroke();
+}
+function drawBtn(b) {
+  const hov = (P.x >= b.x && P.x <= b.x + b.w && P.y >= b.y && P.y <= b.y + b.h);
+  const pulse = b.pulse ? (0.5 + 0.5 * Math.sin(G.sceneT * 8)) : 0;
+  ctx.save();
+  if (pulse) { ctx.shadowColor = b.color; ctx.shadowBlur = 18 * pulse; }
+  rr(b.x, b.y, b.w, b.h, 10);
+  ctx.fillStyle = b.disabled ? 'rgba(90,100,112,.5)' : b.color;
+  ctx.globalAlpha = b.disabled ? 0.7 : (hov ? 1 : 0.92);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.restore();
+  ctx.strokeStyle = 'rgba(255,255,255,' + (hov ? 0.55 : 0.22) + ')'; ctx.lineWidth = 2;
+  rr(b.x, b.y, b.w, b.h, 10); ctx.stroke();
+  txt(b.label, b.x + b.w / 2, b.y + (b.sub ? b.h / 2 - 2 : b.h / 2 + 7), b.size, b.textColor, 'center', 'bold');
+  if (b.sub) txt(b.sub, b.x + b.w / 2, b.y + b.h / 2 + 17, 12, b.subColor, 'center');
+}
+function drawButtons() { for (let i = 0; i < G.buttons.length; i++) drawBtn(G.buttons[i]); }
+function drawMessages() {
+  for (let i = 0; i < G.msgs.length; i++) {
+    const m = G.msgs[i];
+    ctx.globalAlpha = Math.min(1, clamp(m.t / 2.4, 0, 1) * 1.6);
+    const y = 104 + i * 30;
+    rr(46, y - 18, 384, 26, 13); ctx.fillStyle = 'rgba(10,16,24,.78)'; ctx.fill();
+    txt(m.text, 238, y, 15, m.color, 'center');
+    ctx.globalAlpha = 1;
+  }
+}
+
+/* ---------------- 菜单 / 暂停 / 结算 ---------------- */
+function drawMenu() {
+  rect(0, 0, W, H, 'rgba(5,9,14,.70)');
+  rr(80, 56, W - 160, H - 108, 20); ctx.fillStyle = 'rgba(8,12,18,.72)'; ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,.10)'; ctx.lineWidth = 2; ctx.stroke();
+  txt('假装很忙', 640, 116, 64, '#ffffff', 'center', 'bold');
+  txt('老板在你身后 · 别让他看见你的屏幕', 640, 152, 20, '#ffd166', 'center');
+  txt('点击难度卡片选择，按空格 / 回车开始', 640, 180, 15, '#a9bdd2', 'center');
+
+  const keys = Object.keys(CFG);
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i], c = CFG[k];
+    const x = 150 + i * 330, y = 202, w = 300, h = 146;
+    const sel = (G.diffKey === k);
+    rr(x - 6, y - 6, w + 12, h + 12, 14);
+    ctx.fillStyle = sel ? 'rgba(255,209,102,.20)' : 'rgba(255,255,255,.05)'; ctx.fill();
+    ctx.strokeStyle = sel ? '#ffd166' : 'rgba(255,255,255,.16)'; ctx.lineWidth = sel ? 3 : 2; ctx.stroke();
+    txt(c.name, x + w / 2, y + 40, 25, '#ffffff', 'center', 'bold');
+    txt('★'.repeat(c.stars) + '☆'.repeat(3 - c.stars), x + w / 2, y + 70, 19, '#ffd166', 'center');
+    txt(c.tag, x + w / 2, y + 100, 14, '#bdd0e4', 'center');
+    txt('下班 ' + (c.shift / 60) + ' 分钟 · 指标 ' + c.quota + ' 分', x + w / 2, y + 126, 13, '#8fa6bd', 'center');
+  }
+
+  const save = G.saved || loadSave();
+  txt('操作说明', 640, 434, 17, '#ffd166', 'center', 'bold');
+  txt('空格 / Tab：切换屏幕（摸鱼 ⇄ 工作）　　1：藏泡面　　2：收手机', 640, 460, 15, '#d6e4f2', 'center');
+  txt('P：接电话　　R：停电后重启电脑　　H：和路过的同事打招呼', 640, 484, 15, '#d6e4f2', 'center');
+  txt('Esc：暂停　　M：静音　　老板靠近时屏幕边缘会泛红并出现脚步声提示', 640, 508, 15, '#d6e4f2', 'center');
+
+  txt('最高摸鱼积分：' + (save.best || 0) + '　　等级 Lv.' + (save.level || 1) + '　　累计经验 ' + (save.exp || 0),
+      640, 544, 16, '#9be7a1', 'center', 'bold');
+  for (let i = 0; i < ACHS.length; i++) {
+    const a = ACHS[i], got = !!(save.achs && save.achs[a.id]);
+    const x = 250 + (i % 3) * 260, y = 562 + Math.floor(i / 3) * 34;
+    rr(x, y, 246, 28, 8); ctx.fillStyle = got ? 'rgba(155,231,161,.16)' : 'rgba(255,255,255,.05)'; ctx.fill();
+    txt((got ? '🏆 ' : '🔒 ') + a.name, x + 12, y + 19, 13, got ? '#9be7a1' : '#7d8fa3');
+  }
+  txt('提示：老板停留检查时屏幕必须是「工作内容」，泡面和手机也要提前收好', 640, 668, 14, '#8fa6bd', 'center');
+}
+function drawPaused() {
+  rect(0, 0, W, H, 'rgba(5,9,14,.72)');
+  txt('暂停中', 640, 300, 52, '#ffffff', 'center', 'bold');
+  txt('按 Esc 继续', 640, 348, 20, '#a9bdd2', 'center');
+}
+function drawResult() {
+  rect(0, 0, W, H, 'rgba(5,9,14,.80)');
+  const x = 300, y = 76, w = 680, h = 528;
+  rr(x, y, w, h, 18); ctx.fillStyle = 'rgba(16,24,34,.96)'; ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,.12)'; ctx.lineWidth = 2; ctx.stroke();
+
+  const r = G.rating || ratingFor(G.points, G.catches, G.outcome);
+  txt(r.emoji, 640, y + 74, 50, '#fff', 'center');
+  txt(r.title, 640, y + 136, 44, r.color, 'center', 'bold');
+  txt(r.desc, 640, y + 168, 16, '#bdd0e4', 'center');
+  const banner = (G.outcome === 'survived')
+    ? ('成功下班！' + (G.points >= G.cfg.quota ? '摸鱼指标达成 ✓' : '但没完成摸鱼指标（差 ' + (G.cfg.quota - G.points) + ' 分）'))
+    : ('被开除：' + (G.reason || '被抓 3 次'));
+  txt(banner, 640, y + 202, 18, G.outcome === 'survived' ? '#9be7a1' : '#ff8f8f', 'center', 'bold');
+
+  const spent = G.cfg.shift - G.timeLeft;
+  const rows = [
+    ['摸鱼积分', G.points + ' 分'],
+    ['被 抓 次 数', G.catches + ' / 3'],
+    ['成功伪装', G.success + ' 次'],
+    ['最高连击', 'x' + G.maxCombo],
+    ['隐藏动作', G.hiddenCount + ' 次'],
+    ['坚持时长', Math.floor(spent / 60) + ' 分 ' + Math.floor(spent % 60) + ' 秒'],
+    ['难度', G.cfg.name]
+  ];
+  for (let i = 0; i < rows.length; i++) {
+    const ry = y + 240 + i * 30;
+    txt(rows[i][0], x + 60, ry, 16, '#8fa6bd');
+    txt(rows[i][1], x + w - 60, ry, 16, '#e8f2ff', 'right', 'bold');
+  }
+  if (G.newAchs && G.newAchs.length) {
+    let s = '新解锁：';
+    for (let i = 0; i < G.newAchs.length; i++) {
+      const a = ACHS.filter(function (z) { return z.id === G.newAchs[i]; })[0];
+      if (a) s += '🏆' + a.name + '  ';
+    }
+    txt(s, 640, y + 462, 15, '#ffd166', 'center', 'bold');
+  }
+  txt('最高纪录：' + ((G.saved && G.saved.best) || 0) + ' 分　·　等级 Lv.' + ((G.saved && G.saved.level) || 1),
+      640, y + 490, 15, '#9be7a1', 'center');
+}
+
+/* ---------------- 按钮构建与交互 ---------------- */
+const P = { x: -1, y: -1 };
+function btn(x, y, w, h, label, action, opt) {
+  opt = opt || {};
+  G.buttons.push({
+    x: x, y: y, w: w, h: h, label: label, action: action,
+    color: opt.color || '#2f3b4a', textColor: opt.textColor || '#ffffff',
+    size: opt.size || 19, disabled: !!opt.disabled, pulse: !!opt.pulse,
+    sub: opt.sub || '', subColor: opt.subColor || 'rgba(255,255,255,.72)'
+  });
+}
+function buildButtons() {
+  G.buttons = [];
+  if (G.state === 'menu') {
+    const keys = Object.keys(CFG);
+    for (let i = 0; i < keys.length; i++) {
+      btn(150 + i * 330, 202, 300, 146, '', 'diff:' + keys[i],
+        { color: G.diffKey === keys[i] ? 'rgba(255,209,102,.16)' : 'rgba(255,255,255,.04)' });
+    }
+    btn(440, 366, 400, 46, '开始摸鱼（空格）', 'start', { color: '#e0523f', size: 22 });
+  } else if (G.state === 'playing') {
+    const work = (G.screen === 'work');
+    btn(40, 646, 180, 50, G.items.noodle ? '藏泡面 (1)' : '泡面已藏', 'noodle',
+      { color: G.items.noodle ? '#8a5a2b' : '#2f3b4a', size: 17, disabled: !G.items.noodle });
+    btn(232, 646, 180, 50, G.items.phone ? '收手机 (2)' : '手机已收', 'phone',
+      { color: G.items.phone ? '#2f5a8a' : '#2f3b4a', size: 17, disabled: !G.items.phone });
+    btn(430, 640, 380, 62, work ? '当前：认真工作中 → 切回摸鱼' : '当前：摸鱼中 → 切到工作', 'switch',
+      { color: work ? '#2b5797' : '#c9822b', size: 20, sub: '空格 / Tab / 点击' });
+    let cx = 828;
+    if (G.ring > 0) { btn(cx, 646, 160, 50, '接电话 (P)', 'answer', { color: '#c0392b', size: 17, pulse: true }); cx += 172; }
+    if (G.blackout > 0) { btn(cx, 646, 160, 50, '重启电脑 (R)', 'restart', { color: '#2b5797', size: 17, pulse: true }); cx += 172; }
+    if (G.wave && !G.wave.answered) { btn(cx, 646, 160, 50, '打招呼 (H)', 'wave', { color: '#2f6f4f', size: 17 }); cx += 172; }
+    btn(W - 206, 646, 80, 50, '重开', 'restartgame', { color: '#3a2f3f', size: 15 });
+    btn(W - 118, 646, 100, 50, '菜单', 'menu', { color: '#3a2f3f', size: 15 });
+    btn(W - 168, 22, 42, 42, S.muted ? '🔇' : '🔊', 'mute', { color: 'rgba(255,255,255,.12)', size: 18 });
+    btn(W - 120, 22, 42, 42, 'II', 'pause', { color: 'rgba(255,255,255,.12)', size: 16 });
+  } else if (G.state === 'paused') {
+    btn(490, 400, 300, 56, '继续（Esc）', 'pause', { color: '#2b5797', size: 20 });
+    btn(490, 468, 300, 50, '重开一局', 'restartgame', { color: '#8a5a2b', size: 17 });
+    btn(490, 528, 300, 50, '返回菜单', 'menu', { color: '#3a2f3f', size: 17 });
+  } else if (G.state === 'result') {
+    btn(380, 620, 240, 56, '再玩一次', 'restartgame', { color: '#e0523f', size: 20 });
+    btn(650, 620, 240, 56, '换个难度', 'menu', { color: '#2f3b4a', size: 20 });
+  }
+}
+function doAction(a) {
+  audioInit();
+  if (S.ctx && S.ctx.state === 'suspended') S.ctx.resume();
+  if (a.indexOf('diff:') === 0) { G.diffKey = a.slice(5); pushEvent('click'); return; }
+  switch (a) {
+    case 'start': newGame(G.diffKey); break;
+    case 'switch': doSwitch(); break;
+    case 'noodle': hideNoodle(); break;
+    case 'phone': hidePhone(); break;
+    case 'answer': answerPhone(); break;
+    case 'restart': restartPC(); break;
+    case 'wave': waveBack(); break;
+    case 'pause': G.state = (G.state === 'paused') ? 'playing' : 'paused'; pushEvent('click'); break;
+    case 'mute': S.muted = !S.muted; break;
+    case 'menu': G.state = 'menu'; G.saved = loadSave(); pushEvent('click'); break;
+    case 'restartgame': newGame(G.diffKey); break;
+  }
+}
+function toWorld(ev) {
+  const r = cv.getBoundingClientRect();
+  return { x: (ev.clientX - r.left) * (W / r.width), y: (ev.clientY - r.top) * (H / r.height) };
+}
+cv.addEventListener('pointermove', function (e) { const p = toWorld(e); P.x = p.x; P.y = p.y; });
+cv.addEventListener('pointerdown', function (e) {
+  const p = toWorld(e); P.x = p.x; P.y = p.y;
+  audioInit();
+  if (S.ctx && S.ctx.state === 'suspended') S.ctx.resume();
+  for (let i = G.buttons.length - 1; i >= 0; i--) {
+    const b = G.buttons[i];
+    if (!b.disabled && p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h) { doAction(b.action); return; }
+  }
+});
+cv.addEventListener('pointerleave', function () { P.x = -1; P.y = -1; });
+window.addEventListener('keydown', function (e) {
+  audioInit();
+  if (S.ctx && S.ctx.state === 'suspended') S.ctx.resume();
+  const k = e.key;
+  if (e.code === 'Space' || e.code === 'Tab' || k === ' ') {
+    e.preventDefault();
+    if (G.state === 'menu' || G.state === 'result') newGame(G.diffKey);
+    else if (G.state === 'paused') G.state = 'playing';
+    else doSwitch();
+    return;
+  }
+  if (k === '1') hideNoodle();
+  else if (k === '2') hidePhone();
+  else if (k === 'p' || k === 'P') answerPhone();
+  else if (k === 'r' || k === 'R') restartPC();
+  else if (k === 'h' || k === 'H') waveBack();
+  else if (k === 'm' || k === 'M') S.muted = !S.muted;
+  else if (k === 'Escape') { if (G.state === 'playing') G.state = 'paused'; else if (G.state === 'paused') G.state = 'playing'; }
+  else if (k === 'Enter') { if (G.state === 'menu' || G.state === 'result') newGame(G.diffKey); }
+});
+
+/* ---------------- 渲染 & 主循环 ---------------- */
+function render() {
+  buildButtons();
+  ctx.save();
+  ctx.clearRect(0, 0, W, H);
+  if (G.shake > 0) ctx.translate(rnd(-1, 1) * G.shake * 12, rnd(-1, 1) * G.shake * 9);
+  drawRoom();
+  drawColleague();
+  drawBosses();
+  drawPlayerBehind();
+  drawDesk();
+  drawMonitor();
+  drawDeskItems();
+  drawHands();
+  ctx.restore();
+
+  drawVignette();
+  drawWarnings();
+  drawHUD();
+  if (G.state === 'menu') { drawMenu(); drawButtons(); }
+  else if (G.state === 'paused') { drawPaused(); drawButtons(); }
+  else if (G.state === 'result') { drawResult(); drawButtons(); }
+  else { drawMessages(); drawButtons(); }
+}
+function consumeEvents() {
+  for (let i = 0; i < G.events.length; i++) sfx(G.events[i].name, G.events[i].opt);
+  G.events.length = 0;
+}
+let lastT = (window.performance && performance.now) ? performance.now() : Date.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  if (!G.frozen) stepGame(dt);
+  consumeEvents();
+  bgmTick();
+  render();
+  requestAnimationFrame(frame);
+}
+
+/* ============================ 内置自测 ============================ */
+function autopilot() {                        // 模拟一个完美玩家（自测用）
+  const threat = (G.bosses.length > 0 || G.warns.length > 0);
+  if (threat) {
+    if (G.screen !== 'work') doSwitch();
+    hideNoodle(); hidePhone();
+  } else if (G.screen !== 'slack') doSwitch();
+  answerPhone();
+  restartPC();
+}
+function scenario(opts) {
+  newGame('normal');
+  G.spawnTimer = 9999; G.eventTimer = 9999; G.warns = []; G.bosses = [];
+  if (opts.items !== undefined) G.items = { noodle: !!opts.items, phone: !!opts.items };
+  if (opts.screen) G.screen = opts.screen;
+  if (opts.blackout) G.blackout = opts.blackout;
+  const st = rampStats(0);
+  const b = {
+    side: -1, x: 500, doorX: 110, stopX: 500, phase: 'check', phaseT: 0, walkT: 0, stepT: 0,
+    speed: st.speed, checkDur: opts.checkDur || 1.4, itemsScored: false, caught: false,
+    turnBackPending: false, turnBackUsed: false, leaveT: 0, angry: 0, lean: 1
+  };
+  G.bosses = [b];
+  return b;
+}
+function runSelfTest() {
+  const R = [];
+  let fails = 0;
+  // 自测会跑完整局并结算，先把玩家存档备份起来，测完还原，避免污染成就/经验
+  let saveBackup = null;
+  try { saveBackup = localStorage.getItem(SAVE_KEY); } catch (e) { }
+  function ck(name, cond, extra) {
+    R.push((cond ? 'PASS' : 'FAIL') + ' | ' + name + (extra ? ('  [' + extra + ']') : ''));
+    if (!cond) fails++;
+  }
+  function run(sec, dt, pilot) {
+    const n = Math.max(1, Math.round(sec / dt));
+    for (let i = 0; i < n; i++) {
+      if (pilot) pilot();
+      stepGame(dt);
+      G.events.length = 0;                    // 自测不播音，顺便避免事件堆积
+      if (G.state !== 'playing') return;
+    }
+  }
+
+  ck('三种难度配置齐全', !!(CFG.easy && CFG.normal && CFG.hard && CFG.easy.shift && CFG.hard.quota));
+
+  newGame('normal');
+  const s0 = rampStats(0), s5 = rampStats(5);
+  ck('老板速度随时间递增', s5.speed > s0.speed, s0.speed.toFixed(0) + ' -> ' + s5.speed.toFixed(0));
+  ck('出场间隔随时间缩短', s5.spawnMax < s0.spawnMax, s0.spawnMax.toFixed(1) + ' -> ' + s5.spawnMax.toFixed(1));
+  ck('检查停留随时间变长', s5.check > s0.check, s0.check.toFixed(2) + ' -> ' + s5.check.toFixed(2));
+  ck('后期开启双老板概率', rampStats(0).double === 0 && rampStats(5).double > 0);
+
+  newGame('normal');
+  const before = G.screen;
+  doSwitch();
+  ck('切换可在摸鱼/工作之间翻转', G.screen !== before);
+  ck('切换会触发动画', G.switchAnim > 0);
+
+  newGame('normal');
+  G.blackout = 2;
+  const sBefore = G.screen;
+  doSwitch();
+  ck('停电时无法切换屏幕', G.screen === sBefore);
+  restartPC();
+  ck('按 R 可以重启电脑恢复', G.blackout === 0);
+  doSwitch();
+  ck('重启后可以正常切换', G.screen !== sBefore);
+
+  scenario({ screen: 'work', items: false });
+  const p0 = G.points;
+  run(2.0, 1 / 60);
+  ck('工作屏幕通过检查并加分', G.points > p0 && G.success >= 1 && G.catches === 0,
+     'points ' + p0 + ' -> ' + G.points + ', success ' + G.success);
+
+  scenario({ screen: 'slack', items: false });
+  run(1.2, 1 / 60);
+  ck('摸鱼屏幕被老板抓到', G.catches === 1, 'catches=' + G.catches);
+
+  scenario({ screen: 'work', items: true });
+  const p1 = G.points;
+  run(0.6, 1 / 60);
+  ck('泡面和手机都摆着被扣 16 分', G.points === p1 - 16, 'points ' + p1 + ' -> ' + G.points);
+
+  scenario({ screen: 'work', items: false });
+  const p2 = G.points, dh = G.doubleHide;
+  run(0.6, 1 / 60);
+  ck('桌面干净不扣分且计入影帝', G.points === p2 && G.doubleHide === dh + 1);
+
+  scenario({ screen: 'slack', items: false, blackout: 3 });
+  run(1.0, 1 / 60);
+  ck('停电黑屏时不会被抓', G.catches === 0, 'catches=' + G.catches);
+
+  newGame('normal');
+  G.spawnTimer = 9999; G.eventTimer = 9999; G.ring = 1.0;
+  const p3 = G.points;
+  run(1.2, 1 / 60);
+  ck('电话没接扣 12 分', G.ring === 0 && G.points === p3 - 12, 'points ' + p3 + ' -> ' + G.points);
+  newGame('normal');
+  G.spawnTimer = 9999; G.eventTimer = 9999; G.ring = 3.0;
+  const p4 = G.points;
+  answerPhone();
+  ck('及时接电话加分', G.ring === 0 && G.points === p4 + 5);
+
+  const b = scenario({ screen: 'work', items: false, checkDur: 1.0 });
+  run(1.2, 1 / 60);
+  ck('检查结束后老板离开', b.phase === 'leave', 'phase=' + b.phase);
+  b.turnBackPending = true;
+  run(1.5, 1 / 60);
+  ck('突然回头会再次进入检查', b.turnBackUsed === true && (b.phase === 'check' || b.phase === 'leave'), 'phase=' + b.phase);
+
+  ck('评级：被开除', ratingFor(0, 3, 'fired').title === '被开除');
+  ck('评级：摸鱼大师', ratingFor(850, 0, 'survived').title === '摸鱼大师');
+  ck('评级：摸鱼高手', ratingFor(500, 1, 'survived').title === '摸鱼高手');
+  ck('评级：普通社畜', ratingFor(250, 1, 'survived').title === '普通社畜');
+  ck('评级：摸鱼小白', ratingFor(120, 1, 'survived').title === '摸鱼小白');
+
+  newGame('normal');
+  let maxBosses = 0;
+  const pilot = function () { autopilot(); if (G.bosses.length > maxBosses) maxBosses = G.bosses.length; };
+  run(CFG.normal.shift + 2, 1 / 30, pilot);
+  ck('完美玩家能坚持到下班', G.outcome === 'survived', 'outcome=' + G.outcome + ' t=' + G.t.toFixed(0));
+  ck('完美玩家零被抓', G.catches === 0, 'catches=' + G.catches);
+  ck('完美玩家达成摸鱼指标', G.points >= CFG.normal.quota, 'points=' + G.points);
+  ck('一局内成功伪装次数合理', G.success >= 10, 'success=' + G.success);
+  ck('同时最多两个老板', maxBosses <= 2, 'max=' + maxBosses);
+  ck('结算评级非空', !!G.rating && !!G.rating.title, G.rating && G.rating.title);
+  ck('成就：成功下班/从未被抓', !!(G.saved.achs && G.saved.achs.survivor && G.saved.achs.never_caught));
+  ck('经验值/等级已累计', (G.saved.exp || 0) > 0 && (G.saved.level || 0) >= 1,
+     'exp=' + G.saved.exp + ' lv=' + G.saved.level);
+
+  newGame('normal');
+  run(CFG.normal.shift + 2, 1 / 30, null);
+  ck('完全不伪装的玩家被开除', G.outcome === 'fired',
+     'outcome=' + G.outcome + ', catches=' + G.catches + ', points=' + G.points);
+
+  let crashed = null;
+  try {
+    newGame('hard');
+    run(40, 0.5, autopilot);
+    G.state = 'playing';
+    stepGame(0); stepGame(0.001);
+  } catch (e) { crashed = e && e.message; }
+  ck('大时间步长/极端参数下不报错', !crashed, crashed || 'ok');
+
+  G.state = 'menu';
+  try {
+    if (saveBackup === null) localStorage.removeItem(SAVE_KEY);
+    else localStorage.setItem(SAVE_KEY, saveBackup);
+  } catch (e) { }
+  G.saved = loadSave();
+  const pre = document.getElementById('selftest-result');
+  pre.hidden = false;
+  pre.textContent = R.join('\n') + '\n--- ' + (fails ? ('SELFTEST FAIL (' + fails + ')') : 'SELFTEST PASS') + ' ---';
+  document.title = fails ? ('SELFTEST FAIL ' + fails) : 'SELFTEST PASS';
+}
+
+/* ---------------- 启动 ---------------- */
+G.saved = loadSave();
+if (Q.has('selftest')) {
+  runSelfTest();
+} else {
+  if (Q.has('auto') || Q.has('boss')) { newGame(Q.get('diff') || 'normal'); G.state = 'playing'; }
+  if (Q.has('boss')) {                        // 用于截图核对：直接摆出「老板正在检查」的画面
+    G.timeLeft = G.cfg.shift * 0.55; G.points = 188; G.success = 9; G.combo = 3; G.maxCombo = 4;
+    G.catches = 1; G.items.noodle = false; G.screen = 'slack';
+    G.bosses = []; G.warns = [];
+    const st = rampStats(G.t / 60);
+    G.bosses.push({
+      side: -1, x: 500, doorX: 110, stopX: 500, phase: 'check', phaseT: 0.8, walkT: 0,
+      stepT: 0, speed: st.speed, checkDur: 6, itemsScored: true, caught: false,
+      turnBackPending: false, turnBackUsed: true, leaveT: 0, angry: 0, lean: 1
+    });
+    G.tension = 0.9; G.ring = 2.4; G.ringT = 0;
+    msg('老板正在检查屏幕！', '#ff9f43');
+  }
+  if (Q.has('freeze')) G.frozen = true;
+  requestAnimationFrame(frame);
+}
+</script>
+</body>
+</html>
